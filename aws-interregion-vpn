@@ -1,0 +1,524 @@
+﻿#!/bin/sh
+# Мониторинг IPsec ВПН-соединения на AWS
+# Скрипт мониторит доступность тоннеля и партнёрской виртуалки
+# и организует новый тоннель со сменой амазоновских маршрутов, если связь потеряна.
+# @
+# Алексей Якубин@Делобайты
+
+# Партнёрские виртуалки
+# Для наблюдения
+OPPO_ID=i-a555b777
+# Для создания тоннеля
+OPPO_Rem_Part_ID=i-b777e888
+RemUSER=ec2-user
+
+# Удалённая таблица маршрутизации
+Rem_Part_ID=i-c111d222
+
+# Сети
+LocalSubnet=192.168.1.0/24
+RemoteSubnet=192.168.2.0/24
+
+# Таблицы маршрутизации, на которых редактируем маршруты
+My_RT_ID=rtb-1aaa2bbb
+Remote_RT_ID=rtb-2ccc3ddd
+
+# EC2-регионы
+LOCALEC2_URL=https://ec2.us-west-2.amazonaws.com
+REMOTEEC2_URL=https://ec2.us-east-1.amazonaws.com
+
+#Ключ доступа AWS и секретный ключ
+AKID=AAAAAAAAAAAAAAAAAAA
+AK=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+
+# Переменные проверки здоровья машин
+Num_Pings=5
+Ping_Timeout=2
+Wait_Between_Pings=10
+Wait_for_Instance_Stop=60
+Wait_for_Instance_Start=120
+
+#Почтовые переменные
+MAILSUBJ="Внимание, с ВПН что-то не так"
+MAILADDR=admin@mydomain.ru
+SENDLIMFILE=/etc/.lastmailsent
+
+LOGFILE=/var/log/monitor.log
+
+# Запустить aws-apitools-common.sh для настройки дефолтных переменных среды to
+# leverage AWS security credentials provided by EC2 roles
+. /etc/profile.d/aws-apitools-common.sh
+
+# Права EC2, необходимые для работы скрипта - политика IAM-роли:
+# {
+#  "Statement": [
+#    {
+#      "Action": [
+#        "ec2:DescribeInstances",
+#        "ec2:CreateRoute",
+#        "ec2:ReplaceRoute",
+#        "ec2:StartInstances",
+#        "ec2:StopInstances"
+#      ],
+#      "Effect": "Allow",
+#      "Resource": "*"
+#    }
+#  ]
+# }
+
+# Получить собственный ID
+Instance_ID=`/usr/bin/curl --silent http://169.254.169.254/latest/meta-data/instance-id`
+if [ "$?" == "0" ] ; then
+	echo `date` "-- Retrieved instance's ID from meta-data."
+else
+	echo `date` "-- Unable to retrieve instance's ID from meta-data: $?"
+	NOW=`date | cut -b 1-10`
+	LAST=`head -n 1 $SENDLIMFILE`
+	log=$(/usr/bin/tail $LOGFILE)
+	if [ "$NOW" != "$LAST" ]; then
+		echo $NOW > $SENDLIMFILE
+		echo -e "-- Unable to retrieve instance's ID from meta-data, monitoring is not active\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+		echo erretrmdata >> $SENDLIMFILE
+		echo `date` "!- Sending email alert"
+	else
+		alreadySent=$(grep "erretrmdata" $SENDLIMFILE -R)
+		if [ "$alreadySent" != "erretrmdata" ]; then
+			echo -e "-- Unable to retrive instance's ID from meta-data, monitoring is not active\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+			echo erretrmdata >> $SENDLIMFILE
+			echo `date` "-- Sending email alert"
+		fi
+	fi
+fi
+# Получить данные о локальном партнёре
+OPPO_IP=`/opt/aws/bin/ec2-describe-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK | grep PRIVATEIPADDRESS -m 1 | awk '{print $2;}'`
+OPPO_Rem_Part_IP=`/opt/aws/bin/ec2-describe-instances $OPPO_Rem_Part_ID -U $REMOTEEC2_URL -O $AKID -W $AK | grep PRIVATEIPADDRESS -m 1 | awk '{print $2;}'`
+# Получить IP партнёра для создания VPN-тоннеля
+Rem_Part_IP=`/opt/aws/bin/ec2-describe-instances $Rem_Part_ID -U $REMOTEEC2_URL -O $AKID -W $AK | grep PRIVATEIPADDRESS -m 1 | awk '{print $2;}'`
+# Получить регионы
+LOCAL_REGION=$(echo $LOCALEC2_URL | awk -F'.' '{print $2}')
+REMOTE_REGION=$(echo $REMOTEEC2_URL | awk -F'.' '{print $2}')
+
+# Стартовые действия
+echo `date` "-- Starting OPPO monitor"
+# Проверить активный маршрут
+CURRENTLOCALOWNER=`/opt/aws/bin/ec2-describe-route-tables $My_RT_ID --region $LOCAL_REGION -O $AKID -W $AK | grep $RemoteSubnet | awk '{print $2;}'`
+CURRENTREMOTEOWNER=`/opt/aws/bin/ec2-describe-route-tables $Remote_RT_ID --region $REMOTE_REGION -O $AKID -W $AK | grep $LocalSubnet | awk '{print $2;}'`
+if [ "$CURRENTLOCALOWNER" == "$OPPO_ID" ]; then
+	echo `date` "-- Opponent is route owner"
+	# Проверить здоровье удалённого партнёра
+	startpingresult=`ping -c $Num_Pings -W $Ping_Timeout $Rem_Part_IP | grep time= | wc -l`
+	if [ "$startpingresult" != "0" ]; then 
+		echo `date` "-- My tunnel is OK, switching flow to my tunnel instead"
+		/opt/aws/bin/ec2-replace-route $My_RT_ID -r $RemoteSubnet -i $Instance_ID -U $LOCALEC2_URL -O $AKID -W $AK
+		if [ "$?" != "0" ]; then
+			# Если смена маршрутов не удалась, то какой-то умник мог его удалить. Создаём заново
+			/opt/aws/bin/ec2-create-route $My_RT_ID -r $RemoteSubnet -i $Instance_ID -U $LOCALEC2_URL -O $AKID -W $AK
+		fi
+		/opt/aws/bin/ec2-replace-route $Remote_RT_ID -r $LocalSubnet -i $Rem_Part_ID -U $REMOTEEC2_URL -O $AKID -W $AK
+		if [ "$?" != "0" ]; then
+			/opt/aws/bin/ec2-create-route $Remote_RT_ID -r $LocalSubnet -i $Rem_Part_ID -U $REMOTEEC2_URL -O $AKID -W $AK
+		fi
+	else
+		echo `date` "-- My tunnel is not good, trying to fix"
+		/sbin/service ipsec restart
+		if [ "$?" == "0" ]; then
+			echo `date` "-- IPSec daemon has been restarted"
+			doublecheck=`ping -c $Num_Pings -W $Ping_Timeout $Rem_Part_IP | grep time= | wc -l`
+			if [ "$doublecheck" != "0" ]; then
+				echo `date` "-- Tunnel is up! Can take a cup of coffee now..."
+			else
+				echo `date` "-- Tunnel is still down."
+				NOW=`date | cut -b 1-10`
+				LAST=`head -n 1 $SENDLIMFILE`
+				log=$(/usr/bin/tail $LOGFILE)
+				if [ "$NOW" != "$LAST" ]; then
+					echo $NOW > $SENDLIMFILE
+					echo -e "-- Error fixing the tunnel. Please restart some other VPN gateway VM to switch out\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+					echo tunnotfixed >> $SENDLIMFILE
+					echo `date` "!- Sending email alert"
+				else
+					alreadySent=$(grep "tunnotfixed" $SENDLIMFILE -R)
+					if [ "$alreadySent" != "tunnotfixed" ]; then
+						echo -e "-- Error fixing the tunnel. Please restart some other VPN gateway VM to switch out\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+						echo tunnotfixed >> $SENDLIMFILE
+						echo `date` "-- Sending email alert"
+					fi
+				fi
+			fi
+		else
+			echo `date` "-- Error restarting IPSec service: $?"
+			NOW=`date | cut -b 1-10`
+			LAST=`head -n 1 $SENDLIMFILE`
+			log=$(/usr/bin/tail $LOGFILE)
+			if [ "$NOW" != "$LAST" ]; then
+				echo $NOW > $SENDLIMFILE
+				echo -e "-- IPSec service is broken\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+				echo errestipsec >> $SENDLIMFILE
+				echo `date` "!- Sending email alert"
+			else
+				alreadySent=$(grep "errestipsec" $SENDLIMFILE -R)
+				if [ "$alreadySent" != "errestipsec" ]; then
+					echo -e "-- IPSec service is broken\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+					echo errestipsec >> $SENDLIMFILE
+					echo `date` "-- Sending email alert"
+				fi
+			fi
+		fi
+	fi
+elif [ "$CURRENTLOCALOWNER" == "$Instance_ID" ]; then
+	echo `date` "-- I'm the route owner"
+	# Проверить здоровье удалённого партнёра
+	startpingresult=`ping -c $Num_Pings -W $Ping_Timeout $Rem_Part_IP | grep time= | wc -l`
+	if [ "$startpingresult" != "0" ]; then 
+		echo `date` "-- My tunnel is OK, monitoring"
+	else
+		echo `date` "-- My tunnel is not good, trying to fix"
+		/sbin/service ipsec restart
+		if [ "$?" == "0" ]; then
+			echo `date` "-- IPSec daemon has been restarted"
+			doublecheck=`ping -c $Num_Pings -W $Ping_Timeout $Rem_Part_IP | grep time= | wc -l`
+			if [ "$doublecheck" != "0" ]; then
+				echo `date` "-- Tunnel is up! Can take a cup of coffee now..."
+			else
+				echo `date` "-- Tunnel is still down."
+				NOW=`date | cut -b 1-10`
+				LAST=`head -n 1 $SENDLIMFILE`
+				log=$(/usr/bin/tail $LOGFILE)
+				if [ "$NOW" != "$LAST" ]; then
+					echo $NOW > $SENDLIMFILE
+					echo -e "-- Error fixing the tunnel. Please restart some other VPN gateway VM to switch out\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+					echo tunnotfixed >> $SENDLIMFILE
+					echo `date` "!- Sending email alert"
+				else
+					alreadySent=$(grep "tunnotfixed" $SENDLIMFILE -R)
+					if [ "$alreadySent" != "tunnotfixed" ]; then
+						echo -e "-- Error fixing the tunnel. Please restart some other VPN gateway VM to switch out\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+						echo tunnotfixed >> $SENDLIMFILE
+						echo `date` "-- Sending email alert"
+					fi
+				fi
+			fi
+		else
+			echo `date` "-- Error restarting IPSec service: $?"
+			NOW=`date | cut -b 1-10`
+			LAST=`head -n 1 $SENDLIMFILE`
+			log=$(/usr/bin/tail $LOGFILE)
+			if [ "$NOW" != "$LAST" ]; then
+				echo $NOW > $SENDLIMFILE
+				echo -e "-- IPSec service is broken\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+				echo errestipsec >> $SENDLIMFILE
+				echo `date` "!- Sending email alert"
+			else
+				alreadySent=$(grep "errestipsec" $SENDLIMFILE -R)
+				if [ "$alreadySent" != "errestipsec" ]; then
+					echo -e "-- IPSec service is broken\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+					echo errestipsec >> $SENDLIMFILE
+					echo `date` "-- Sending email alert"
+				fi
+			fi
+		fi	
+	fi
+else
+	echo `date` "-- Route owner is a system I don't know"
+	startpingresult=`ping -c $Num_Pings -W $Ping_Timeout $Rem_Part_IP | grep time= | wc -l`
+	if [ "$startpingresult" != "0" ]; then 
+		echo `date` "-- My tunnel is OK, switching flow to my tunnel instead"
+		/opt/aws/bin/ec2-replace-route $My_RT_ID -r $RemoteSubnet -i $Instance_ID -U $LOCALEC2_URL -O $AKID -W $AK
+		if [ "$?" != "0" ]; then
+			/opt/aws/bin/ec2-create-route $My_RT_ID -r $RemoteSubnet -i $Instance_ID -U $LOCALEC2_URL -O $AKID -W $AK
+		fi
+		/opt/aws/bin/ec2-replace-route $Remote_RT_ID -r $LocalSubnet -i $Rem_Part_ID -U $REMOTEEC2_URL -O $AKID -W $AK
+		if [ "$?" != "0" ]; then
+			/opt/aws/bin/ec2-create-route $Remote_RT_ID -r $LocalSubnet -i $Rem_Part_ID -U $REMOTEEC2_URL -O $AKID -W $AK
+		fi
+	else
+		echo `date` "-- My tunnel is not good, trying to fix"
+		/sbin/service ipsec restart
+		if [ "$?" == "0" ]; then
+			echo `date` "-- IPSec daemon has been restarted"
+			doublecheck=`ping -c $Num_Pings -W $Ping_Timeout $Rem_Part_IP | grep time= | wc -l`
+			if [ "$doublecheck" != "0" ]; then
+				echo `date` "-- Tunnel is up! Can take a cup of coffee now..."
+			else
+				echo `date` "-- Tunnel is still down."
+				NOW=`date | cut -b 1-10`
+				LAST=`head -n 1 $SENDLIMFILE`
+				log=$(/usr/bin/tail $LOGFILE)
+				if [ "$NOW" != "$LAST" ]; then
+					echo $NOW > $SENDLIMFILE
+					echo -e "-- Error fixing the tunnel. Please restart some other VPN gateway VM to switch out\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+					echo tunnotfixed >> $SENDLIMFILE
+					echo `date` "!- Sending email alert"
+				else
+					alreadySent=$(grep "tunnotfixed" $SENDLIMFILE -R)
+					if [ "$alreadySent" != "tunnotfixed" ]; then
+						echo -e "-- Error fixing the tunnel. Please restart some other VPN gateway VM to switch out\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+						echo tunnotfixed >> $SENDLIMFILE
+						echo `date` "-- Sending email alert"
+					fi
+				fi
+			fi
+		else
+			echo `date` "-- Error restarting IPSec service: $?"
+			NOW=`date | cut -b 1-10`
+			LAST=`head -n 1 $SENDLIMFILE`
+			log=$(/usr/bin/tail $LOGFILE)
+			if [ "$NOW" != "$LAST" ]; then
+				echo $NOW > $SENDLIMFILE
+				echo -e "-- IPSec service is broken\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+				echo errestipsec >> $SENDLIMFILE
+				echo `date` "!- Sending email alert"
+			else
+				alreadySent=$(grep "errestipsec" $SENDLIMFILE -R)
+				if [ "$alreadySent" != "errestipsec" ]; then
+					echo -e "-- IPSec service is broken\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+					echo errestipsec >> $SENDLIMFILE
+					echo `date` "-- Sending email alert"
+				fi
+			fi
+		fi
+	fi
+fi
+
+# Процесс наблюдения
+while [ . ]; do
+	# Проверить здоровье локального партнёра
+	pingresult=`ping -c $Num_Pings -W $Ping_Timeout $OPPO_IP | grep time= | wc -l`
+	if [ "$pingresult" == "0" ]; then
+		echo `date` "-- Opponent's heartbeat failed."
+		CURRENTLOCALOWNER=`/opt/aws/bin/ec2-describe-route-tables $My_RT_ID --region $LOCAL_REGION -O $AKID -W $AK | grep $RemoteSubnet | awk '{print $2;}'`	
+		if [ "$CURRENTLOCALOWNER" == "$OPPO_ID" ]; then
+			partpingresult=`ping -c $Num_Pings -W $Ping_Timeout $Rem_Part_IP | grep time= | wc -l`
+			if [ "$partpingresult" != "0" ]; then
+				echo `date` "-- Damn, broken opponent was the active gateway, need to take over"
+				# Ставим переменные в нездоровое состояние (0)
+				ROUTE_HEALTHY=0
+				OPPO_HEALTHY=0
+				STOPPING_OPPO=0
+				# Циклуемся пока пытаемся починить
+				while [ "$OPPO_HEALTHY" == "0" ]; do
+					if [ "$ROUTE_HEALTHY" == "0" ]; then
+						echo `date` "-- Taking over $My_RT_ID default route"
+						/opt/aws/bin/ec2-replace-route $My_RT_ID -r $RemoteSubnet -i $Instance_ID -U $LOCALEC2_URL -O $AKID -W $AK
+						/opt/aws/bin/ec2-replace-route $Remote_RT_ID -r $LocalSubnet -i $Rem_Part_ID -U $REMOTEEC2_URL -O $AKID -W $AK
+						ROUTE_HEALTHY=1
+					fi
+					# Проверим состояние локального партнёра, чтобы понять, надо ли остановить и запустить его снова
+					OPPO_STATE=`/opt/aws/bin/ec2-describe-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK | grep INSTANCE | awk '{print $6;}'`
+					if [ "$OPPO_STATE" == "stopped" ]; then
+						echo `date` "-- OPPO instance is stopped, starting it back up"
+						/opt/aws/bin/ec2-start-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK
+						OPPO_HEALTHY=1
+						sleep $Wait_for_Instance_Start
+					else
+						if [ "$STOPPING_OPPO" == "0" ]; then
+							echo `date` "-- OPPO instance $OPPO_STATE, attempting to stop for reboot"
+							/opt/aws/bin/ec2-stop-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK
+							STOPPING_OPPO=1
+						fi
+						sleep $Wait_for_Instance_Stop
+					fi
+				done
+			else
+				echo `date` "-- Opponent is broken, but my tunnel is also not available! Trying to fix"
+				/sbin/service ipsec restart
+				if [ "$?" == "0" ]; then
+					echo `date` "-- IPSec deamon has been restarted"
+					doublecheck=`ping -c $Num_Pings -W $Ping_Timeout $Rem_Part_IP | grep time= | wc -l`
+					if [ "$doublecheck" != "0" ]; then
+						echo `date` "-- Tunnel is up! Taking over..."
+						ROUTE_HEALTHY=0
+						OPPO_HEALTHY=0
+						STOPPING_OPPO=0
+						while [ "$OPPO_HEALTHY" == "0" ]; do
+							if [ "$ROUTE_HEALTHY" == "0" ]; then
+								echo `date` "-- Taking over $My_RT_ID default route"
+								/opt/aws/bin/ec2-replace-route $My_RT_ID -r $RemoteSubnet -i $Instance_ID -U $LOCALEC2_URL -O $AKID -W $AK
+								/opt/aws/bin/ec2-replace-route $Remote_RT_ID -r $LocalSubnet -i $Rem_Part_ID -U $REMOTEEC2_URL -O $AKID -W $AK
+								ROUTE_HEALTHY=1
+							fi
+							OPPO_STATE=`/opt/aws/bin/ec2-describe-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK | grep INSTANCE | awk '{print $6;}'`
+							if [ "$OPPO_STATE" == "stopped" ]; then
+								echo `date` "-- OPPO instance is stopped, starting it back up"
+								/opt/aws/bin/ec2-start-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK
+								OPPO_HEALTHY=1
+								sleep $Wait_for_Instance_Start
+							else
+								if [ "$STOPPING_OPPO" == "0" ]; then
+									echo `date` "-- OPPO instance $OPPO_STATE, attempting to stop for reboot"
+									/opt/aws/bin/ec2-stop-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK
+									STOPPING_OPPO=1
+								fi
+								sleep $Wait_for_Instance_Stop
+							fi
+						done
+					else
+						echo `date` "-- Tunnel is still down"
+						NOW=`date | cut -b 1-10`
+						LAST=`head -n 1 $SENDLIMFILE`
+						log=$(/usr/bin/tail $LOGFILE)
+						if [ "$NOW" != "$LAST" ]; then
+							echo $NOW > $SENDLIMFILE
+							echo -e "-- Error fixing the tunnel. Please restart some other VPN gateway VM to switch out\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+							echo tunnotfixed >> $SENDLIMFILE
+							echo `date` "!- Sending email alert"
+						else
+							alreadySent=$(grep "tunnotfixed" $SENDLIMFILE -R)
+							if [ "$alreadySent" != "tunnotfixed" ]; then
+								echo -e "-- Error fixing the tunnel. Please restart some other VPN gateway VM to switch out\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+								echo tunnotfixed >> $SENDLIMFILE
+								echo `date` "-- Sending email alert"
+							fi
+						fi
+					fi
+				else
+					echo `date` "-- Error restarting IPSec service: $?"
+					NOW=`date | cut -b 1-10`
+					LAST=`head -n 1 $SENDLIMFILE`
+					log=$(/usr/bin/tail $LOGFILE)
+					if [ "$NOW" != "$LAST" ]; then
+						echo $NOW > $SENDLIMFILE
+						echo -e "-- IPSec service is broken\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+						echo ipsecnotrest >> $SENDLIMFILE
+						echo `date` "!- Sending email alert"
+					else
+						alreadySent=$(grep "ipsecnotrest" $SENDLIMFILE -R)
+						if [ "$alreadySent" != "ipsecnotrest" ]; then
+							echo -e "-- IPSec service is broken\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+							echo ipsecnotrest >> $SENDLIMFILE
+							echo `date` "-- Sending email alert"
+						fi
+					fi
+				fi
+			fi
+		else
+			echo `date` "-- Traffic goes through my or some other tunnel. Not critical, but let's try to fix opponent"
+			OPPO_HEALTHY=0
+			STOPPING_OPPO=0
+			while [ "$OPPO_HEALTHY" == "0" ]; do
+				OPPO_STATE=`/opt/aws/bin/ec2-describe-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK | grep INSTANCE | awk '{print $6;}'`
+				if [ "$OPPO_STATE" == "stopped" ]; then
+					echo `date` "-- OPPO instance is stopped, starting it back up"
+					/opt/aws/bin/ec2-start-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK
+					OPPO_HEALTHY=1
+					sleep $Wait_for_Instance_Start
+				else
+					if [ "$STOPPING_OPPO" == "0" ]; then
+						echo `date` "-- OPPO instance $OPPO_STATE, attempting to stop for reboot"
+						/opt/aws/bin/ec2-stop-instances $OPPO_ID -U $LOCALEC2_URL -O $AKID -W $AK
+						STOPPING_OPPO=1
+					fi
+					sleep $Wait_for_Instance_Stop
+				fi
+			done
+		fi
+	else
+		# Пинги проходят, проверяем глубже
+		ipsecstatus=`ssh -t -t -o ConnectTimeout=3 $RemUSER@$OPPO_IP sudo service ipsec status | grep IPsec | awk '{print $2;}' 2>&1`
+		if [ "$?" == "0" ] ; then
+			if [ "$ipsecstatus" == "running" ]; then
+				# Сервис IPsec в порядке, проверим ещё
+				checkoppotunnel=`ssh -t -t -o ConnectTimeout=3 $RemUSER@$OPPO_IP "sudo ping -c $Num_Pings -W $Ping_Timeout \$OPPO_Rem_Part_IP | grep time= | wc -l"`
+				if [ "$?" == "0" ]; then
+					if [ "$checkoppotunnel" == "0" ]; then
+						echo `date` "-- Opponent's IPSec tunnel is not up: $checkoppotunnel"
+						NOW=`date | cut -b 1-10`
+						LAST=`head -n 1 $SENDLIMFILE`
+						log=$(/usr/bin/tail $LOGFILE)
+						if [ "$NOW" != "$LAST" ]; then
+							echo $NOW > $SENDLIMFILE
+							echo -e "-- Opponent's IPSec tunnel is not up\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+							echo tunnotup >> $SENDLIMFILE
+							echo `date` "!- Sending email alert"
+						else
+							alreadySent=$(grep "tunnotup" $SENDLIMFILE -R)
+							if [ "$alreadySent" != "tunnotup" ]; then
+								echo -e "-- Opponent's ipsec tunnel is not up\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+								echo tunnotup >> $SENDLIMFILE
+								echo `date` "-- Sending email alert"
+							fi
+						fi
+					fi
+				else
+					echo `date` "-- Error checking IPSec tunnel: $?"
+					NOW=`date | cut -b 1-10`
+					LAST=`head -n 1 $SENDLIMFILE`
+					log=$(/usr/bin/tail $LOGFILE)
+					if [ "$NOW" != "$LAST" ]; then
+						echo $NOW > $SENDLIMFILE
+						echo -e "-- Error checking IPSec tunnel\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+						echo ipsecnotchk >> $SENDLIMFILE
+						echo `date` "!- Sending email alert"
+					else
+						alreadySent=$(grep "ipsecnotchk" $SENDLIMFILE -R)
+						if [ "$alreadySent" != "ipsecnotchk" ]; then
+							echo -e "-- Error checking IPSec tunnel\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+							echo ipsecnotchk >> $SENDLIMFILE
+							echo `date` "-- Sending email alert"
+						fi
+					fi
+				fi
+			else
+				echo `date` "-- Opponent's IPSec service status is $ipsecstatus"
+				NOW=`date | cut -b 1-10`
+				LAST=`head -n 1 $SENDLIMFILE`
+				log=$(/usr/bin/tail $LOGFILE)
+				if [ "$NOW" != "$LAST" ]; then
+					echo $NOW > $SENDLIMFILE
+					echo -e "-- Unusual opponent's IPSec service status\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+					echo unipsecstat >> $SENDLIMFILE
+					echo `date` "!- Sending email alert"
+				else
+					alreadySent=$(grep "unipsecstat" $SENDLIMFILE -R)
+					if [ "$alreadySent" != "unipsecstat" ]; then
+						echo -e "-- Unusual opponent's IPSec service status\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+						echo unipsecstat >> $SENDLIMFILE
+						echo `date` "-- Sending email alert"
+					fi
+				fi
+				# Можем попытаться перезапустить сервис у локального партнёра, если есть желание
+				# ipsecstopstatus=$(ssh -t -t ec2-user@$OPPO_IP sudo service ipsec stop)
+				# if [ "$?" == "0" ]; then
+				#	echo `date` "!- ${ipsecstopstatus}"
+				#	sleep $Wait_for_IPSec_Stop
+				#	ipsecstopcheck=$(ssh -t -t ec2-user@$OPPO_IP sudo service ipsec status | grep IPsec 2>&1)
+				#	echo `date` "-- ${ipsecstopcheck}"
+				#	if [ "$ipsecstopcheck" == "IPsec stopped" ]; then
+				#		echo `date` "-- Opponent's IPSec has been stopped, starting"
+				#		ipsecstartstatus=$(ssh -t -t ec2-user@$OPPO_IP sudo service ipsec start 2>&1)
+				#		if [ "$?" == "0" ]; then
+				#			sleep $Wait_for_IPSec_Start
+				#			echo `date` "-- Start signal has been sent"
+				#		else
+				#			echo `date` "-- Error attempting to start opponent's IPSec: $? "
+				#		fi
+				#	else
+				#		echo `date` "-- Wasn't able to stop opponent's IPSec: $ipsecstopcheck"
+				#	fi
+				# else
+				#	echo `date` "-- Error attempting to fix opponent's IPSec: $? "
+				# fi
+			fi
+		else
+			echo`date` "-- Error getting opponent's IPSec status: $?"
+			NOW=`date | cut -b 1-10`
+			LAST=`head -n 1 $SENDLIMFILE`
+			log=$(/usr/bin/tail $LOGFILE)
+			if [ "$NOW" != "$LAST" ]; then
+				echo $NOW > $SENDLIMFILE
+				echo -e "-- Error getting opponent's IPSec status\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+				echo errgetipsecstat >> $SENDLIMFILE
+				echo `date` "!- Sending email alert"
+				
+			else
+				alreadySent=$(grep "errgetipsecstat" $SENDLIMFILE -R)
+				if [ "$alreadySent" != "errgetipsecstat" ]; then
+					echo -e "-- Error getting opponent's IPSec status\n $log" | mail -s "$MAILSUBJ" $MAILADDR
+					echo errgetipsecstat >> $SENDLIMFILE
+					echo `date` "-- Sending email alert"
+				fi
+			fi
+		fi
+		sleep $Wait_Between_Pings
+	fi
+done
